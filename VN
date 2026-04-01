@@ -1,0 +1,669 @@
+"""
+MSIS 522 — HW1: COVID-19 Mortality Prediction
+Streamlit Dashboard
+Loads pre-trained models from ../models/ — does NOT retrain.
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import os
+import shap
+import warnings
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="COVID-19 Mortality Prediction — MSIS 522", layout="wide")
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR  = os.path.join(BASE, "..", "models")
+OUTPUT_DIR = os.path.join(BASE, "..", "outputs")
+DATA_DIR   = os.path.join(BASE, "..", "data")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOAD ARTIFACTS (cached so they load once)
+# ──────────────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def load_models():
+    models = {}
+    models["Logistic Regression"] = joblib.load(os.path.join(MODEL_DIR, "logistic_regression.pkl"))
+    models["Decision Tree"]       = joblib.load(os.path.join(MODEL_DIR, "decision_tree.pkl"))
+    models["Random Forest"]       = joblib.load(os.path.join(MODEL_DIR, "random_forest.pkl"))
+    models["LightGBM"]            = joblib.load(os.path.join(MODEL_DIR, "lightgbm.pkl"))
+    return models
+
+@st.cache_resource
+def load_mlp():
+    from tensorflow import keras
+    path = os.path.join(MODEL_DIR, "mlp_model.keras")
+    if not os.path.exists(path):
+        path = os.path.join(MODEL_DIR, "mlp_best.keras")
+    return keras.models.load_model(path)
+
+@st.cache_resource
+def load_scaler():
+    return joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
+
+@st.cache_resource
+def load_feature_names():
+    return joblib.load(os.path.join(MODEL_DIR, "feature_names.pkl"))
+
+@st.cache_resource
+def load_shap_explainer():
+    return joblib.load(os.path.join(MODEL_DIR, "shap_explainer.pkl"))
+
+@st.cache_data
+def load_metrics():
+    path = os.path.join(OUTPUT_DIR, "model_metrics.csv")
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    return None
+
+@st.cache_data
+def load_data():
+    csv_path = os.path.join(DATA_DIR, "covid.csv")
+    if os.path.exists(csv_path):
+        data = pd.read_csv(csv_path, usecols=lambda c: c not in ["Unnamed: 0"])
+        data.columns = data.columns.str.strip().str.replace(" ", "_")
+        # Create balanced sample as in notebook
+        d1 = data[data["DEATH"] == 1].sample(n=5000, random_state=42)
+        d0 = data[data["DEATH"] == 0].sample(n=5000, random_state=42)
+        df = pd.concat([d1, d0]).reset_index(drop=True)
+        return data, df
+    return None, None
+
+# Load everything
+try:
+    sklearn_models = load_models()
+    mlp_model      = load_mlp()
+    scaler         = load_scaler()
+    FEATURE_NAMES  = load_feature_names()
+    shap_explainer = load_shap_explainer()
+    metrics_df     = load_metrics()
+    raw_data, df   = load_data()
+    ALL_LOADED = True
+except Exception as e:
+    ALL_LOADED = False
+    st.error(f"Error loading artifacts: {e}")
+    st.info("Make sure you have run the notebook first to generate saved models in ../models/")
+    st.stop()
+
+# Helper: which models need scaled input
+SCALED_MODELS = {"Logistic Regression", "MLP Neural Network"}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TABS
+# ──────────────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📋 Executive Summary",
+    "📊 Descriptive Analytics",
+    "🏆 Model Performance",
+    "🔍 Explainability & Interactive Prediction",
+])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — EXECUTIVE SUMMARY
+# ══════════════════════════════════════════════════════════════════════════════
+with tab1:
+    st.title("COVID-19 Patient Mortality Risk Prediction")
+    st.subheader("Executive Summary")
+
+    st.markdown("""
+    ### Dataset & Prediction Task
+
+    This project analyzes anonymized medical records from approximately **one million COVID-19 patients
+    in Mexico**, sourced from the General Directorate of Epidemiology of the Mexican Ministry of Health.
+    Each patient record contains **16 features**: the patient's age, biological sex, and the presence or
+    absence of 14 clinical indicators — including whether the patient was hospitalized, tested
+    COVID-positive, and whether they had pre-existing conditions such as pneumonia, diabetes,
+    hypertension, COPD, obesity, cardiovascular disease, chronic renal disease, asthma,
+    immunosuppression, or tobacco use. The target variable, **DEATH**, records whether each patient
+    ultimately survived (0) or died (1).
+
+    ### Why This Matters
+
+    Predicting which COVID-19 patients face the highest mortality risk is not an academic exercise — it is
+    a practical tool for **hospital triage and resource allocation**. During pandemic surges, intensive care
+    beds, ventilators, and specialist attention are scarce. A reliable risk-stratification model can help
+    clinicians identify patients who need aggressive early intervention, and it can guide hospital
+    administrators in distributing limited resources to where they will save the most lives. Understanding
+    *which* factors drive mortality — and by how much — also informs public health messaging and
+    vaccination prioritization strategies.
+
+    ### Approach
+
+    Because the raw dataset is heavily imbalanced (roughly 10 survivors for every 1 death), we created a
+    balanced working sample of 10,000 patients (5,000 deceased, 5,000 survivors) to ensure that models
+    learn to predict both classes effectively. We then trained and compared five models of increasing
+    complexity: **Logistic Regression** (interpretable baseline), **Decision Tree** (transparent rule-based),
+    **Random Forest** (ensemble), **LightGBM** (gradient boosted trees), and a **Multi-Layer Perceptron
+    neural network**. Each model (except Logistic Regression and MLP) was tuned via 5-fold
+    cross-validated grid search using the F1 score, with a held-out 30% test set reserved for final
+    evaluation. All models use `random_state=42` for full reproducibility.
+
+    ### Key Findings
+
+    **Age is by far the most powerful predictor of COVID-19 mortality.** Patients who died were
+    substantially older on average than survivors, and every model — from logistic regression to gradient
+    boosting — ranks age as the dominant feature. **Pneumonia at time of admission** is the second
+    strongest signal: patients presenting with pneumonia face dramatically higher mortality risk,
+    suggesting that severe respiratory involvement at intake should trigger immediate escalation.
+    Cardiovascular disease, chronic renal disease, and hospitalization status also contribute meaningfully.
+
+    Among all models, **LightGBM achieved the best overall performance**, with the highest F1 score and
+    AUC-ROC on the held-out test set. Random Forest followed closely. SHAP analysis confirmed that the
+    model's decision logic aligns with established clinical knowledge — older patients with pneumonia and
+    cardiovascular disease are flagged as high-risk, while younger patients without severe comorbidities
+    are predicted to survive. This clinical face-validity is essential for any model that might be deployed in
+    a real healthcare setting.
+
+    We recommend deploying LightGBM with an **optimized probability threshold** (tuned via Youden's J
+    statistic) rather than the default 0.5 cutoff, because in a clinical context, failing to identify a
+    high-risk patient (false negative) is far more costly than flagging an extra patient for monitoring (false
+    positive). SHAP explanations should accompany every prediction to ensure transparency and clinician
+    trust.
+    """)
+
+    if metrics_df is not None:
+        st.markdown("### Model Performance at a Glance")
+        st.dataframe(metrics_df.style.format({
+            "Accuracy": "{:.4f}", "Precision": "{:.4f}",
+            "Recall": "{:.4f}", "F1": "{:.4f}", "AUC-ROC": "{:.4f}"
+        }).highlight_max(subset=["F1", "AUC-ROC"], color="#d4edda"), use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — DESCRIPTIVE ANALYTICS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab2:
+    st.title("Descriptive Analytics")
+    st.markdown("""
+    This section explores the COVID-19 mortality dataset through visualizations that reveal
+    the structure of the data and the relationships between patient features and the target variable DEATH.
+    The working dataset is a balanced sample of 10,000 patients (5,000 survived, 5,000 died).
+    """)
+
+    if df is not None:
+        # --- Target Distribution ---
+        st.subheader("1. Target Distribution")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        ax = sns.countplot(x="DEATH", data=df, palette=["steelblue", "tomato"], ax=axes[0])
+        axes[0].bar_label(ax.containers[0], fontsize=11)
+        axes[0].set_title("Balanced Working Sample", fontsize=13, fontweight="bold")
+        axes[0].set_xticklabels(["Survived (0)", "Died (1)"])
+        axes[0].set_ylabel("Count")
+
+        if raw_data is not None:
+            raw_counts = raw_data["DEATH"].value_counts().sort_index()
+            bars = axes[1].bar(["Survived (0)", "Died (1)"], raw_counts.values,
+                               color=["steelblue", "tomato"])
+            for bar in bars:
+                axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5000,
+                             f"{bar.get_height():,}", ha="center", va="bottom", fontsize=9)
+            axes[1].set_title("Full Raw Dataset (~1M rows)", fontsize=13, fontweight="bold")
+            axes[1].set_ylabel("Count")
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        st.caption(
+            "**Interpretation:** The raw dataset is severely imbalanced — roughly 10 survivors for every "
+            "1 death, which is typical for pandemic mortality data. Training directly on this imbalance "
+            "would produce a model that almost always predicts 'survived.' We address this by balanced "
+            "under-sampling to 5,000 patients per class, yielding the 50/50 working dataset shown on the left."
+        )
+
+        # --- Age Histogram ---
+        st.subheader("2. Age Distribution by Outcome")
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        ax.hist(df[df["DEATH"] == 0]["AGE"], bins=30, alpha=0.6, color="steelblue", label="Survived")
+        ax.hist(df[df["DEATH"] == 1]["AGE"], bins=30, alpha=0.6, color="tomato", label="Died")
+        mean_surv = df[df["DEATH"] == 0]["AGE"].mean()
+        mean_died = df[df["DEATH"] == 1]["AGE"].mean()
+        ax.axvline(mean_surv, color="steelblue", linestyle="--", lw=2,
+                   label=f"Mean age (survived): {mean_surv:.1f}")
+        ax.axvline(mean_died, color="tomato", linestyle="--", lw=2,
+                   label=f"Mean age (died): {mean_died:.1f}")
+        ax.set_xlabel("Age"); ax.set_ylabel("Count")
+        ax.set_title("Age Distribution by Mortality Outcome", fontsize=13, fontweight="bold")
+        ax.legend(fontsize=9)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        st.caption(
+            "**Interpretation:** The age distributions differ markedly between the two groups. Patients who "
+            "died skew substantially older, with their distribution concentrated in the 50–80 age range. "
+            "Survivors are spread more evenly toward younger ages. This confirms age as one of the strongest "
+            "risk factors for COVID-19 mortality, consistent with global epidemiological evidence."
+        )
+
+        # --- Boxplot ---
+        st.subheader("3. Age Boxplot by Mortality Outcome")
+        fig, ax = plt.subplots(figsize=(7, 5))
+        df_temp = df.copy()
+        df_temp["Outcome"] = df_temp["DEATH"].map({0: "Survived", 1: "Died"})
+        sns.boxplot(x="Outcome", y="AGE", data=df_temp, palette=["steelblue", "tomato"],
+                    order=["Survived", "Died"], ax=ax)
+        ax.set_title("Age Distribution by Outcome", fontsize=13, fontweight="bold")
+        ax.set_ylabel("Age (years)")
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        st.caption(
+            "**Interpretation:** The boxplot reveals a clear upward shift in age for patients who died — the "
+            "median age of deceased patients is substantially higher than that of survivors. The interquartile "
+            "range for the deceased group sits in a notably older bracket, reinforcing that age is the most "
+            "discriminating feature for predicting COVID-19 mortality."
+        )
+
+        # --- Mortality by Comorbidity ---
+        st.subheader("4. Mortality Rate by Comorbidity")
+        comorbidities = ["PNEUMONIA", "DIABETES", "COPD", "HYPERTENSION", "CARDIOVASCULAR",
+                         "RENAL_CHRONIC", "OBESITY", "ASTHMA", "IMMUNOSUPPRESSION", "TOBACCO"]
+        mortality_rates = {}
+        for col in comorbidities:
+            if col in df.columns:
+                r_with    = df[df[col] == 1]["DEATH"].mean() * 100
+                r_without = df[df[col] == 0]["DEATH"].mean() * 100
+                mortality_rates[col] = (r_with, r_without)
+
+        conditions    = list(mortality_rates.keys())
+        rates_with    = [mortality_rates[c][0] for c in conditions]
+        rates_without = [mortality_rates[c][1] for c in conditions]
+        x = np.arange(len(conditions))
+        width = 0.35
+
+        fig, ax = plt.subplots(figsize=(13, 5.5))
+        bars1 = ax.bar(x - width/2, rates_with,    width, label="Has Condition",  color="tomato",    alpha=0.85)
+        bars2 = ax.bar(x + width/2, rates_without, width, label="No Condition",   color="steelblue", alpha=0.85)
+        ax.set_ylabel("Mortality Rate (%)")
+        ax.set_title("Mortality Rate: With vs. Without Each Comorbidity", fontsize=13, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(conditions, rotation=35, ha="right", fontsize=9)
+        ax.legend(fontsize=10)
+        ax.set_ylim(0, 100)
+        ax.bar_label(bars1, fmt="%.0f%%", fontsize=7)
+        ax.bar_label(bars2, fmt="%.0f%%", fontsize=7)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        st.caption(
+            "**Interpretation:** Pneumonia shows the largest absolute gap in mortality rate between patients "
+            "who have and do not have the condition — it is the strongest comorbidity-level risk signal. "
+            "Cardiovascular disease, COPD, renal chronic disease, and immunosuppression also elevate mortality "
+            "meaningfully. Interestingly, obesity and asthma show smaller differentials, suggesting they are "
+            "less discriminating as standalone predictors of COVID-19 death."
+        )
+
+        # --- Mortality by Sex + Violin ---
+        st.subheader("5. Mortality Rate by Sex & Age-Sex-Outcome Violin")
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        sex_mortality = df.groupby("SEX")["DEATH"].mean() * 100
+        sex_labels = {0: "Male", 1: "Female"}
+        bars = axes[0].bar([sex_labels[s] for s in sex_mortality.index],
+                           sex_mortality.values, color=["#4e79a7", "#f28e2b"], width=0.4)
+        axes[0].set_title("Mortality Rate by Sex", fontsize=13, fontweight="bold")
+        axes[0].set_ylabel("Mortality Rate (%)")
+        axes[0].set_ylim(0, 80)
+        axes[0].bar_label(bars, fmt="%.1f%%", fontsize=11)
+
+        df_v = df.copy()
+        df_v["Sex_Label"] = df_v["SEX"].map({0: "Male", 1: "Female"})
+        df_v["Outcome"]   = df_v["DEATH"].map({0: "Survived", 1: "Died"})
+        sns.violinplot(x="Sex_Label", y="AGE", hue="Outcome", data=df_v,
+                       split=True, palette=["steelblue", "tomato"], inner="quart", ax=axes[1])
+        axes[1].set_title("Age by Sex and Outcome (Violin)", fontsize=13, fontweight="bold")
+        axes[1].set_xlabel("Sex"); axes[1].set_ylabel("Age (years)")
+        axes[1].legend(title="Outcome", fontsize=9)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        st.caption(
+            "**Interpretation:** Male patients exhibit a higher mortality rate than female patients, consistent "
+            "with well-documented sex disparities in COVID-19 outcomes — potentially driven by differences in "
+            "immune response and cardiovascular risk factor prevalence. The violin plots further show that "
+            "among deceased patients, the age distribution skews older for both sexes, but the heavier right "
+            "tail for males reinforces that older men face compounded risk."
+        )
+
+        # --- Correlation Heatmap ---
+        st.subheader("6. Correlation Heatmap")
+        feature_cols = [c for c in df.columns if c not in ["Outcome", "Sex_Label"]]
+        corr_matrix = df[feature_cols].corr()
+        mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+
+        fig, ax = plt.subplots(figsize=(12, 9))
+        sns.heatmap(corr_matrix, mask=mask, annot=True, fmt=".2f", cmap="RdBu_r",
+                    center=0, vmin=-1, vmax=1, linewidths=0.5,
+                    annot_kws={"size": 7}, ax=ax)
+        ax.set_title("Correlation Matrix — COVID-19 Mortality Dataset", fontsize=13, fontweight="bold")
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        st.caption(
+            "**Interpretation:** Age shows the strongest positive correlation with DEATH among all features, "
+            "confirming it as the dominant single predictor. Pneumonia and hospitalization also correlate "
+            "meaningfully with mortality. Among comorbidities, hypertension and diabetes correlate with each "
+            "other (they frequently co-occur), but their individual correlations with death are lower than "
+            "age's — suggesting that in isolation, comorbidities are less discriminating than age."
+        )
+    else:
+        st.warning("Dataset not found. Please place covid.csv in the data/ directory.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — MODEL PERFORMANCE
+# ══════════════════════════════════════════════════════════════════════════════
+with tab3:
+    st.title("Model Performance")
+    st.markdown("""
+    Five models were trained on a 70/30 stratified train/test split (random_state=42). Tree-based models
+    used unscaled features; Logistic Regression and MLP used StandardScaler. All tuned models used
+    5-fold cross-validated GridSearchCV with F1 scoring.
+    """)
+
+    if metrics_df is not None:
+        st.subheader("Model Comparison Table")
+        st.dataframe(
+            metrics_df.style.format({
+                "Accuracy": "{:.4f}", "Precision": "{:.4f}",
+                "Recall": "{:.4f}", "F1": "{:.4f}", "AUC-ROC": "{:.4f}"
+            }).highlight_max(subset=["F1", "AUC-ROC"], color="#d4edda"),
+            use_container_width=True
+        )
+
+        # F1 Bar Chart
+        st.subheader("F1 Score Comparison")
+        fig, ax = plt.subplots(figsize=(10, 5))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(metrics_df)))
+        bars = ax.bar(metrics_df["Model"], metrics_df["F1"], color=colors, edgecolor="white", lw=0.8)
+        ax.bar_label(bars, fmt="%.4f", fontsize=10, padding=3)
+        ax.set_ylim(0, 1.0)
+        ax.set_ylabel("F1 Score", fontsize=12)
+        ax.set_title("F1 Score Comparison Across All Models", fontsize=14, fontweight="bold")
+        ax.set_xticklabels(metrics_df["Model"], rotation=20, ha="right", fontsize=10)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        st.caption(
+            "**Interpretation:** LightGBM and Random Forest achieve the highest F1 scores, followed by the "
+            "MLP neural network. This is expected — gradient-boosted and ensemble tree methods consistently "
+            "excel on structured tabular data with a mix of binary and continuous features. The Logistic "
+            "Regression baseline is competitive given the largely binary feature set, while the Decision Tree "
+            "is the most interpretable but sacrifices accuracy."
+        )
+
+        # ROC Curves
+        st.subheader("ROC Curves — All Models")
+        if df is not None:
+            from sklearn.model_selection import train_test_split
+            from sklearn.metrics import roc_curve, roc_auc_score
+            from sklearn.preprocessing import StandardScaler as SS
+
+            X = df.drop(columns=["DEATH"] + [c for c in df.columns if c in ["Outcome", "Sex_Label"]])
+            y = df["DEATH"]
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.30, random_state=42, stratify=y
+            )
+            sc = SS()
+            X_train_s = sc.fit_transform(X_train)
+            X_test_s  = sc.transform(X_test)
+
+            fig, ax = plt.subplots(figsize=(8, 6.5))
+            model_colors = {
+                "Logistic Regression": "steelblue",
+                "Decision Tree": "orange",
+                "Random Forest": "darkorange",
+                "LightGBM": "green",
+            }
+            for name, mdl in sklearn_models.items():
+                if name in SCALED_MODELS:
+                    proba = mdl.predict_proba(X_test_s)[:, 1]
+                else:
+                    proba = mdl.predict_proba(X_test)[:, 1]
+                fpr, tpr, _ = roc_curve(y_test, proba)
+                auc = roc_auc_score(y_test, proba)
+                ax.plot(fpr, tpr, lw=2, color=model_colors.get(name, "gray"),
+                        label=f"{name} (AUC={auc:.3f})")
+
+            # MLP
+            try:
+                mlp_proba = mlp_model.predict(X_test_s, verbose=0).flatten()
+                fpr_m, tpr_m, _ = roc_curve(y_test, mlp_proba)
+                auc_m = roc_auc_score(y_test, mlp_proba)
+                ax.plot(fpr_m, tpr_m, lw=2, color="purple",
+                        label=f"MLP Neural Network (AUC={auc_m:.3f})")
+            except Exception:
+                pass
+
+            ax.plot([0, 1], [0, 1], "k--", lw=1.2, label="Random Classifier")
+            ax.set_xlabel("False Positive Rate", fontsize=12)
+            ax.set_ylabel("True Positive Rate", fontsize=12)
+            ax.set_title("ROC Curves — All Models", fontsize=14, fontweight="bold")
+            ax.legend(fontsize=9, loc="lower right")
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close()
+
+            st.caption(
+                "**Interpretation:** All models substantially outperform random guessing (diagonal line). "
+                "LightGBM and Random Forest hug the upper-left corner most closely, indicating the best "
+                "trade-off between sensitivity and specificity. The Decision Tree shows slightly lower "
+                "AUC due to its piecewise-constant probability estimates."
+            )
+
+        # Best Hyperparameters
+        st.subheader("Best Hyperparameters (from GridSearchCV)")
+        hp_data = {
+            "Decision Tree": "max_depth, min_samples_leaf — tuned via GridSearchCV(cv=5, scoring='f1') over max_depth=[3,5,7,10], min_samples_leaf=[5,10,20,50]",
+            "Random Forest": "n_estimators, max_depth — tuned via GridSearchCV(cv=5, scoring='f1') over n_estimators=[50,100,200], max_depth=[3,5,8]",
+            "LightGBM": "n_estimators, max_depth, learning_rate — tuned via GridSearchCV(cv=5, scoring='f1') over n_estimators=[50,100,200], max_depth=[3,4,6], learning_rate=[0.01,0.05,0.1]",
+        }
+        # Try to extract actual best params from saved models
+        hp_rows = []
+        for name, mdl in sklearn_models.items():
+            params = mdl.get_params()
+            if name == "Decision Tree":
+                hp_rows.append({
+                    "Model": name,
+                    "Best Hyperparameters": f"max_depth={params.get('max_depth')}, min_samples_leaf={params.get('min_samples_leaf')}"
+                })
+            elif name == "Random Forest":
+                hp_rows.append({
+                    "Model": name,
+                    "Best Hyperparameters": f"n_estimators={params.get('n_estimators')}, max_depth={params.get('max_depth')}"
+                })
+            elif name == "LightGBM":
+                hp_rows.append({
+                    "Model": name,
+                    "Best Hyperparameters": f"n_estimators={params.get('n_estimators')}, max_depth={params.get('max_depth')}, learning_rate={params.get('learning_rate')}"
+                })
+        if hp_rows:
+            st.table(pd.DataFrame(hp_rows))
+        st.caption("Logistic Regression used default settings (C=1.0, max_iter=1000). "
+                   "MLP architecture: two hidden layers with BatchNorm and Dropout, Adam optimizer, "
+                   "binary cross-entropy loss, early stopping on validation loss.")
+
+        # Model comparison paragraph
+        st.subheader("Analysis")
+        st.markdown("""
+        LightGBM and Random Forest delivered the strongest performance across all metrics, with LightGBM
+        achieving the highest F1 and AUC-ROC scores. This outcome aligns with established benchmarks on
+        tabular data — gradient-boosted trees are well suited to datasets with a mix of binary indicators
+        and one continuous feature (age). The MLP neural network performed competitively but required
+        significantly more training time and offers less interpretability. The Decision Tree is the most
+        transparent model (its full logic can be visualized as a flowchart) but trades accuracy for that
+        transparency. Logistic Regression, despite being the simplest model, provides a strong baseline —
+        reflecting the fact that the underlying feature set is predominantly binary and the decision
+        boundary is reasonably linear. For deployment in a clinical setting, LightGBM with SHAP
+        explanations provides the best balance of predictive power and interpretability.
+        """)
+
+    else:
+        st.warning("No metrics file found. Run the notebook to generate model_metrics.csv.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — EXPLAINABILITY & INTERACTIVE PREDICTION
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.title("Explainability & Interactive Prediction")
+
+    # --- SHAP Plots ---
+    st.subheader("SHAP Analysis — LightGBM (Best Tree-Based Model)")
+    st.markdown("SHAP (SHapley Additive exPlanations) decomposes each prediction into per-feature contributions, "
+                "revealing *why* the model makes a given decision.")
+
+    # Generate SHAP values from test data
+    if df is not None:
+        from sklearn.model_selection import train_test_split as tts2
+        X_full = df.drop(columns=["DEATH"] + [c for c in df.columns if c in ["Outcome", "Sex_Label"]])
+        y_full = df["DEATH"]
+        _, X_test_shap, _, _ = tts2(X_full, y_full, test_size=0.30, random_state=42, stratify=y_full)
+
+        try:
+            shap_values = shap_explainer.shap_values(X_test_shap)
+            if isinstance(shap_values, list):
+                sv = shap_values[1]
+            else:
+                sv = shap_values
+
+            # Beeswarm
+            st.markdown("#### SHAP Summary Plot (Beeswarm)")
+            fig_bee, ax_bee = plt.subplots(figsize=(10, 6))
+            shap.summary_plot(sv, X_test_shap, feature_names=FEATURE_NAMES, show=False)
+            st.pyplot(fig_bee)
+            plt.close("all")
+
+            st.caption(
+                "**Interpretation:** Each dot represents one patient. The horizontal position shows how much "
+                "that feature pushed the prediction toward death (right) or survival (left). Color indicates "
+                "the feature's actual value — red is high, blue is low. Age dominates: high age values "
+                "consistently push predictions toward death. Pneumonia and hospitalization are the next most "
+                "influential features."
+            )
+
+            # Bar Plot
+            st.markdown("#### SHAP Feature Importance (Mean |SHAP|)")
+            fig_bar, ax_bar = plt.subplots(figsize=(9, 5))
+            shap.summary_plot(sv, X_test_shap, feature_names=FEATURE_NAMES,
+                              plot_type="bar", show=False)
+            st.pyplot(fig_bar)
+            plt.close("all")
+
+            st.caption(
+                "**Interpretation:** This bar chart ranks features by their average absolute SHAP value across "
+                "all test predictions. Age has the largest mean impact, followed by pneumonia, cardiovascular "
+                "disease, and hospitalization. Features at the bottom (e.g., pregnancy, asthma) have minimal "
+                "influence on the model's mortality predictions."
+            )
+        except Exception as e:
+            st.warning(f"Could not generate SHAP plots from explainer: {e}")
+            # Fall back to saved images
+            for img_name, title in [
+                ("shap_summary_beeswarm.png", "SHAP Summary Plot (Beeswarm)"),
+                ("shap_bar_plot.png", "SHAP Feature Importance"),
+            ]:
+                img_path = os.path.join(OUTPUT_DIR, img_name)
+                if os.path.exists(img_path):
+                    st.markdown(f"#### {title}")
+                    st.image(img_path, use_container_width=True)
+
+    # --- Interactive Prediction ---
+    st.markdown("---")
+    st.subheader("Interactive Patient Risk Prediction")
+    st.markdown("Adjust the patient features below and select a model to see the predicted mortality risk "
+                "in real time. Features not shown below are set to their dataset median/mode values.")
+
+    col_left, col_right = st.columns([1, 1])
+
+    with col_left:
+        age = st.slider("Age", min_value=0, max_value=110, value=55, step=1)
+        sex = st.selectbox("Sex", options=[0, 1], format_func=lambda x: "Male" if x == 0 else "Female")
+        pneumonia = st.selectbox("Pneumonia", [0, 1], format_func=lambda x: "No" if x == 0 else "Yes")
+        diabetes = st.selectbox("Diabetes", [0, 1], format_func=lambda x: "No" if x == 0 else "Yes")
+        hypertension = st.selectbox("Hypertension", [0, 1], format_func=lambda x: "No" if x == 0 else "Yes")
+        obesity = st.selectbox("Obesity", [0, 1], format_func=lambda x: "No" if x == 0 else "Yes")
+
+    with col_right:
+        copd = st.selectbox("COPD", [0, 1], format_func=lambda x: "No" if x == 0 else "Yes")
+        cardiovascular = st.selectbox("Cardiovascular Disease", [0, 1], format_func=lambda x: "No" if x == 0 else "Yes")
+        renal = st.selectbox("Chronic Renal Disease", [0, 1], format_func=lambda x: "No" if x == 0 else "Yes")
+        tobacco = st.selectbox("Tobacco Use", [0, 1], format_func=lambda x: "No" if x == 0 else "Yes")
+        hospitalized = st.selectbox("Hospitalized", [0, 1], index=1, format_func=lambda x: "No" if x == 0 else "Yes")
+        covid_positive = st.selectbox("COVID Positive", [0, 1], index=1, format_func=lambda x: "No" if x == 0 else "Yes")
+
+    # Build feature vector in the correct order
+    # Default values for features not exposed in the UI
+    defaults = {
+        "SEX": sex, "HOSPITALIZED": hospitalized, "PNEUMONIA": pneumonia,
+        "AGE": age, "PREGNANT": 0, "DIABETES": diabetes, "COPD": copd,
+        "ASTHMA": 0, "IMMUNOSUPPRESSION": 0, "HYPERTENSION": hypertension,
+        "OTHER_DISEASE": 0, "CARDIOVASCULAR": cardiovascular, "OBESITY": obesity,
+        "RENAL_CHRONIC": renal, "TOBACCO": tobacco, "COVID_POSITIVE": covid_positive,
+    }
+    input_row = pd.DataFrame([{f: defaults.get(f, 0) for f in FEATURE_NAMES}])
+
+    # Model selection
+    model_choice = st.selectbox(
+        "Select Model for Prediction",
+        ["Logistic Regression", "Decision Tree", "Random Forest", "LightGBM", "MLP Neural Network"]
+    )
+
+    if st.button("Predict", type="primary"):
+        # Prepare input
+        if model_choice in SCALED_MODELS or model_choice == "MLP Neural Network":
+            input_array = scaler.transform(input_row)
+        else:
+            input_array = input_row.values
+
+        # Predict
+        if model_choice == "MLP Neural Network":
+            prob = float(mlp_model.predict(input_array, verbose=0).flatten()[0])
+            pred_class = int(prob >= 0.5)
+        else:
+            mdl = sklearn_models[model_choice]
+            prob = float(mdl.predict_proba(input_array)[:, 1][0])
+            pred_class = int(prob >= 0.5)
+
+        # Display result
+        st.markdown("---")
+        res_col1, res_col2 = st.columns(2)
+        with res_col1:
+            label = "⚠️ **HIGH RISK — Predicted: DIED**" if pred_class == 1 else "✅ **LOW RISK — Predicted: SURVIVED**"
+            color = "#ff4b4b" if pred_class == 1 else "#00cc66"
+            st.markdown(f"### {label}")
+            st.markdown(f"**Probability of death:** `{prob:.2%}`")
+        with res_col2:
+            st.metric("Predicted Class", "Died (1)" if pred_class == 1 else "Survived (0)")
+            st.metric("Death Probability", f"{prob:.4f}")
+
+        # SHAP Waterfall for this specific input
+        if model_choice in ["LightGBM", "Random Forest", "Decision Tree"]:
+            st.markdown("#### SHAP Waterfall — This Patient")
+            try:
+                shap_exp = shap_explainer(input_row)
+                if isinstance(shap_exp, list):
+                    shap_exp = shap_exp[1]
+                fig_wf, ax_wf = plt.subplots(figsize=(10, 6))
+                shap.waterfall_plot(shap_exp[0], show=False)
+                st.pyplot(fig_wf)
+                plt.close("all")
+                st.caption(
+                    "**Interpretation:** The waterfall plot decomposes this individual prediction into "
+                    "per-feature contributions. Red bars push the prediction toward death; blue bars push "
+                    "toward survival. The base value is the average model output, and each feature shifts "
+                    "the prediction from there."
+                )
+            except Exception as e:
+                st.info(f"Waterfall plot available only for tree-based models with the SHAP TreeExplainer. ({e})")
+        else:
+            st.info("SHAP waterfall plots are available when a tree-based model (Decision Tree, Random Forest, or LightGBM) is selected.")
