@@ -6,6 +6,4 @@ seaborn
 joblib
 scikit-learn
 lightgbm
-tensorflow
 shap
-warnings
